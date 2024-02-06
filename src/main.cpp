@@ -1,51 +1,52 @@
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <VanBusRx.h>
 #include <VwRaiseCanbox.h>
-#include <SoftwareSerial.h>
+#include <esp32_arduino_rmt_van_rx.h>
+#include <esp32_rmt_van_rx.h>
 #include <RCSwitch.h>
 #include "main.h"
 #include "psa_msgs.h"
 
+TaskHandle_t VANReadDataTask;
 VwRaiseCanboxRemote* remote;
-SoftwareSerial usbSerial;
 DoorStatus door_status;
 CarStatus car_status;
 RCSwitch mySwitch = RCSwitch();
+ESP32_RMT_VAN_RX VAN_RX;
 
-char* ToHexStr(uint8_t data) {
-    #define MAX_UINT8_HEX_STR_SIZE 5
-    static char buffer[MAX_UINT8_HEX_STR_SIZE];
-    sprintf_P(buffer, PSTR("0x%02X"), data);
+const uint8_t VAN_DATA_RX_RMT_CHANNEL = 0;
 
-    return buffer;
-}
+uint8_t vanMessageLength;
+uint8_t vanMessage[34];
 
 void send_car_info() {
   remote->SendCarInfo(&car_status, &door_status);
 }
 
-VanPacketParseResult_t ParseVanPacket(TVanPacketRxDesc* pkt) {
-    if (! pkt->CheckCrc()) return VAN_PACKET_PARSE_CRC_ERROR;
+void DumpData(uint16_t iden, uint8_t* data, uint8_t data_len){
+  printf("\nIden: %03X; Data: ", iden);
+  for (size_t i = 0; i < data_len; i++){
+    if (i != vanMessageLength - 1)
+    {
+        printf("%02X ", data[i]);
+    }
+    else
+    {
+        printf("%02X", data[i]);
+    }
+  }
+  printf("\n");
+}
 
-    int dataLen = pkt->DataLen();
-    if (dataLen < 0 || dataLen > 28) return VAN_PACKET_PARSE_UNEXPECTED_LENGTH;
-
-    const uint8_t* data = pkt->Data();
-    uint16_t iden = pkt->Iden();
+void ParseData(uint16_t iden, uint8_t* data, uint8_t dataLen) {
+    if (dataLen < 0 || dataLen > 28) return;
 
     switch (iden) {
         case LIGHTS_STATUS_IDEN:
         {
-            static uint8_t packetData[VAN_MAX_DATA_BYTES] = "";
-            if (memcmp(data, packetData, dataLen) == 0) return VAN_PACKET_DUPLICATE;
-            memcpy(packetData, data, dataLen);
-
             if (dataLen != 11 && dataLen != 14)
             {
-                return VAN_PACKET_PARSE_UNEXPECTED_LENGTH;
+                return;
             }
-
 
             if(data[5] & 0x40){
                 mySwitch.send(GARAGE_DOOR_CODE);
@@ -61,13 +62,9 @@ VanPacketParseResult_t ParseVanPacket(TVanPacketRxDesc* pkt) {
 
         case CAR_STATUS2_IDEN:
         {
-            static uint8_t packetData[VAN_MAX_DATA_BYTES] = "";
-            if (memcmp(data, packetData, dataLen) == 0) return VAN_PACKET_DUPLICATE;
-            memcpy(packetData, data, dataLen);
-
             if (dataLen != 14 && dataLen != 16)
             {
-                return VAN_PACKET_PARSE_UNEXPECTED_LENGTH;
+                return;
             }
 
             door_status.status.hand_brake = data[5] & 0x01 ? 0 : 1;
@@ -84,30 +81,11 @@ VanPacketParseResult_t ParseVanPacket(TVanPacketRxDesc* pkt) {
         }
         break;
 
-        case DASHBOARD_BUTTONS_IDEN:
-        {
-            static uint8_t packetData[VAN_MAX_DATA_BYTES] = "";  // Previous packet data
-            if (memcmp(data, packetData, dataLen) == 0) return VAN_PACKET_DUPLICATE;
-            memcpy(packetData, data, dataLen);
-
-            if (dataLen != 11 && dataLen != 12)
-            {
-                return VAN_PACKET_PARSE_UNEXPECTED_LENGTH;
-            }
-
-            car_status.current_fuel = (data[4] / 2.0);
-        }
-        break;
-
         case DASHBOARD_IDEN:
         {
-            static uint8_t packetData[VAN_MAX_DATA_BYTES] = "";  // Previous packet data
-            if (memcmp(data, packetData, dataLen) == 0) return VAN_PACKET_DUPLICATE;
-            memcpy(packetData, data, dataLen);
-
             if (dataLen != 7)
             {
-                return VAN_PACKET_PARSE_UNEXPECTED_LENGTH;
+                return;
             }
 
             uint16_t engineRpm = (uint16_t)data[0] << 8 | data[1];
@@ -120,13 +98,9 @@ VanPacketParseResult_t ParseVanPacket(TVanPacketRxDesc* pkt) {
 
         case ENGINE_IDEN:
         {
-            static uint8_t packetData[VAN_MAX_DATA_BYTES] = "";  // Previous packet data
-            if (memcmp(data, packetData, dataLen) == 0) return VAN_PACKET_DUPLICATE;
-            memcpy(packetData, data, dataLen);
-
             if (dataLen != 7)
             {
-                return VAN_PACKET_PARSE_UNEXPECTED_LENGTH;
+                return;
             }
 
             car_status.current_temperature = (((data[6] - 80) / 2.0) - 32) * 5/9;
@@ -136,13 +110,9 @@ VanPacketParseResult_t ParseVanPacket(TVanPacketRxDesc* pkt) {
 
         case CAR_STATUS1_IDEN:
         {
-            static uint8_t packetData[VAN_MAX_DATA_BYTES] = "";  // Previous packet data
-            if (memcmp(data + 1, packetData, dataLen - 2) == 0) return VAN_PACKET_DUPLICATE;
-            memcpy(packetData, data + 1, dataLen - 2);
-
             if (dataLen != 27)
             {
-                return VAN_PACKET_PARSE_UNEXPECTED_LENGTH;
+                return;
             }
 
             door_status.status.front_left  =    data[7] & 0x40 ? 1 : 0;
@@ -155,79 +125,54 @@ VanPacketParseResult_t ParseVanPacket(TVanPacketRxDesc* pkt) {
 
         default:
         {
-            return VAN_PACKET_PARSE_UNRECOGNIZED_IDEN;
+            return;
         }
         break;
     }
+}
 
-    return VAN_PACKET_PARSE_OK;
+void VANReadDataTaskFunction(void * parameter) {
+  VAN_RX.Init(VAN_DATA_RX_RMT_CHANNEL, VAN_RX_PIN, VAN_LINE_LEVEL_HIGH, VAN_NETWORK_TYPE_COMFORT);
+
+  for (;;) {
+    VAN_RX.Receive(&vanMessageLength, vanMessage);
+    if (vanMessageLength > 0) {
+      if(VAN_RX.IsCrcOk(vanMessage, vanMessageLength)) {
+        uint16_t vanIden = (vanMessage[1] << 8 | vanMessage[2]) >> 4;
+        uint8_t dataLenght = vanMessageLength - 5;
+
+        memmove(vanMessage, vanMessage + 3, dataLenght);
+        ParseData(vanIden, vanMessage, dataLenght);
+      }
+    }
+    vTaskDelay(5 / portTICK_PERIOD_MS);
+  }
 }
 
 void setup()
 {
-    delay(1000);
     Serial.begin(115200);
-    WiFi.disconnect(true);
-    delay(1);
-    WiFi.mode(WIFI_OFF);
-    delay(1);
-    WiFi.forceSleepBegin();
-    delay(1);
-
-    VanBusRx.Setup(VAN_RX_PIN);
-    usbSerial.begin(38400, SWSERIAL_8N1, RXD2, TXD2);
-
-    remote = new VwRaiseCanboxRemote(usbSerial);
+    Serial1.begin(38400, SERIAL_8N1, RXD2, TXD2);
+    remote = new VwRaiseCanboxRemote(Serial1);
     uint8_t ver[] = SW_VERSION;
     remote->SendVersion(ver, sizeof(ver));
     Serial.println(SW_VERSION);
     mySwitch.enableTransmit(RF_TX_PIN);
     mySwitch.setProtocol(6);
     mySwitch.setRepeatTransmit(15);
+
+    xTaskCreatePinnedToCore(
+        VANReadDataTaskFunction,        // Function to implement the task
+        "VANReadDataTask",              // Name of the task
+        20000,                          // Stack size in words
+        NULL,                           // Task input parameter
+        1,                              // Priority of the task (higher the number, higher the priority)
+        &VANReadDataTask,               // Task handle.
+        0);                             // Core where the task should run
 }
 
-bool IsPacketSelected(uint16_t iden, VanPacketFilter_t filter) {
-    if (filter == VAN_PACKETS_ALL_VAN_PKTS) {
-        if (
-            true
-            && iden != ENGINE_IDEN
-            && iden != LIGHTS_STATUS_IDEN
-            && iden != CAR_STATUS1_IDEN
-            && iden != CAR_STATUS2_IDEN
-            && iden != DASHBOARD_IDEN
-           )
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    return true;
-}
-
-void loop()
-{
-    int n = 0;
-    while (VanBusRx.Available()) {
-        TVanPacketRxDesc pkt;
-        bool isQueueOverrun = false;
-        VanBusRx.Receive(pkt, &isQueueOverrun);
-
-        if (isQueueOverrun) Serial.print(F("QUEUE OVERRUN!\n"));
-
-        pkt.CheckCrcAndRepair();
-
-        uint16_t iden = pkt.Iden();
-
-        if (! IsPacketSelected(iden, VAN_PACKETS_ALL_VAN_PKTS)) continue;
-
-        ParseVanPacket(&pkt);
-
-        //pkt.DumpRaw(Serial);
-
-        if (++n >= 15) break;
-    }
+void loop() {
+    vTaskDelay(50 / portTICK_PERIOD_MS);
 
     static unsigned long lastUpdate = 0;
     if (millis() - lastUpdate >= 200UL)
